@@ -28,10 +28,10 @@ spec:
         runAsNonRoot: true
       containers:
       - command:
-        - /manager
+        - /ko-app/project
         args:
         - --leader-elect
-        image: controller:latest
+        image: ko://tutorial.kubebuilder.io/project
         name: manager
         securityContext:
           allowPrivilegeEscalation: false

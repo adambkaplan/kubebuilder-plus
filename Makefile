@@ -1,6 +1,18 @@
 
-# Image URL to use all building/pushing image targets
-IMG ?= controller:latest
+# Image repository hosting the container image
+# Container images produced by ko will have the package appended to the path
+IMAGE_REPO ?= ghcr.io/adambkaplan/kubebuilder-plus
+
+# Tag to use when building the container image
+TAG ?= latest
+
+# Format for the SBOM produced by ko.
+# Defaults to "spdx", use "none" to disable SBOM generation
+SBOM ?= "spdx"
+
+# Pass in options directly to ko
+KO_OPTS ?= -B -t ${TAG} --sbom=${SBOM}
+
 # ENVTEST_K8S_VERSION refers to the version of kubebuilder assets to be downloaded by envtest binary.
 ENVTEST_K8S_VERSION = 1.23
 
@@ -73,13 +85,13 @@ build: generate fmt vet ## Build manager binary.
 run: manifests generate fmt vet ## Run a controller from your host.
 	go run ./main.go
 
-.PHONY: docker-build
-docker-build: test ## Build docker image with the manager.
-	docker build -t ${IMG} .
+.PHONY: container-build
+container-build: test ko ## Build the container image with the manager.
+	KO_DOCKER_REPO=${IMAGE_REPO} $(KO) build . --push=false ${KO_OPTS}
 
-.PHONY: docker-push
-docker-push: ## Push docker image with the manager.
-	docker push ${IMG}
+.PHONY: container-push
+container-push: ko ## Push the container image with the manager.
+	KO_DOCKER_REPO=${IMAGE_REPO} $(KO) build . ${KO_OPTS}
 
 ##@ Deployment
 
@@ -96,9 +108,8 @@ uninstall: manifests kustomize ## Uninstall CRDs from the K8s cluster specified 
 	$(KUSTOMIZE) build config/crd | kubectl delete --ignore-not-found=$(ignore-not-found) -f -
 
 .PHONY: deploy
-deploy: manifests kustomize ## Deploy controller to the K8s cluster specified in ~/.kube/config.
-	cd config/manager && $(KUSTOMIZE) edit set image controller=${IMG}
-	$(KUSTOMIZE) build config/default | kubectl apply -f -
+deploy: manifests kustomize ko ## Build and deploy the controller to the K8s cluster specified in ~/.kube/config.
+	$(KUSTOMIZE) build config/default | KO_DOCKER_REPO=${IMAGE_REPO} $(KO) apply ${KO_OPTS} -f -
 
 .PHONY: undeploy
 undeploy: ## Undeploy controller from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
@@ -115,10 +126,12 @@ $(LOCALBIN): ## Ensure that the directory exists
 KUSTOMIZE ?= $(LOCALBIN)/kustomize
 CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen
 ENVTEST ?= $(LOCALBIN)/setup-envtest
+KO ?= $(LOCALBIN)/ko
 
 ## Tool Versions
 KUSTOMIZE_VERSION ?= v3.8.7
 CONTROLLER_TOOLS_VERSION ?= v0.8.0
+KO_VERSION ?= v0.11.2
 
 KUSTOMIZE_INSTALL_SCRIPT ?= "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh"
 .PHONY: kustomize
@@ -135,3 +148,8 @@ $(CONTROLLER_GEN):
 envtest: $(ENVTEST) ## Download envtest-setup locally if necessary.
 $(ENVTEST):
 	GOBIN=$(LOCALBIN) go install sigs.k8s.io/controller-runtime/tools/setup-envtest@latest
+
+.PHONY: ko
+ko: $(KO) ## Download ko locally if necessary
+$(KO):
+	GOBIN=$(LOCALBIN) go install github.com/google/ko@$(KO_VERSION)
