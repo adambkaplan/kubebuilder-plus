@@ -23,13 +23,10 @@ package controllers
 
 import (
 	"context"
-	"fmt"
 	"sort"
 	"time"
 
-	"github.com/robfig/cron"
 	kbatch "k8s.io/api/batch/v1"
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ref "k8s.io/client-go/tools/reference"
@@ -38,6 +35,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	batchv1 "tutorial.kubebuilder.io/project/api/v1"
+	"tutorial.kubebuilder.io/project/pkg/cron"
+	"tutorial.kubebuilder.io/project/pkg/job"
 )
 
 /*
@@ -110,15 +109,8 @@ func (r *CronJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	/*
-		### 2: List all active jobs, and update the status
-
-		To fully update our status, we'll need to list all child jobs in this namespace that belong to this CronJob.
-		Similarly to Get, we can use the List method to list the child jobs.  Notice that we use variadic options to
-		set the namespace and field match (which is actually an index lookup that we set up below).
-	*/
-	var childJobs kbatch.JobList
-	if err := r.List(ctx, &childJobs, client.InNamespace(req.Namespace), client.MatchingFields{jobOwnerKey: req.Name}); err != nil {
+	childJobs, err := job.ListJobsForCronJob(ctx, r.Client, req.Namespace, req.Name)
+	if err != nil {
 		log.Error(err, "unable to list child Jobs")
 		return ctrl.Result{}, err
 	}
@@ -154,42 +146,12 @@ func (r *CronJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	var failedJobs []*kbatch.Job
 	var mostRecentTime *time.Time // find the last run so we can update the status
 
-	/*
-		We consider a job "finished" if it has a "Complete" or "Failed" condition marked as true.
-		Status conditions allow us to add extensible status information to our objects that other
-		humans and controllers can examine to check things like completion and health.
-	*/
-	isJobFinished := func(job *kbatch.Job) (bool, kbatch.JobConditionType) {
-		for _, c := range job.Status.Conditions {
-			if (c.Type == kbatch.JobComplete || c.Type == kbatch.JobFailed) && c.Status == corev1.ConditionTrue {
-				return true, c.Type
-			}
-		}
-
-		return false, ""
-	}
 	// +kubebuilder:docs-gen:collapse=isJobFinished
 
-	/*
-		We'll use a helper to extract the scheduled time from the annotation that
-		we added during job creation.
-	*/
-	getScheduledTimeForJob := func(job *kbatch.Job) (*time.Time, error) {
-		timeRaw := job.Annotations[scheduledTimeAnnotation]
-		if len(timeRaw) == 0 {
-			return nil, nil
-		}
-
-		timeParsed, err := time.Parse(time.RFC3339, timeRaw)
-		if err != nil {
-			return nil, err
-		}
-		return &timeParsed, nil
-	}
 	// +kubebuilder:docs-gen:collapse=getScheduledTimeForJob
 
-	for i, job := range childJobs.Items {
-		_, finishedType := isJobFinished(&job)
+	for i, childJob := range childJobs.Items {
+		_, finishedType := job.IsJobFinished(&childJob)
 		switch finishedType {
 		case "": // ongoing
 			activeJobs = append(activeJobs, &childJobs.Items[i])
@@ -201,9 +163,9 @@ func (r *CronJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 		// We'll store the launch time in an annotation, so we'll reconstitute that from
 		// the active jobs themselves.
-		scheduledTimeForJob, err := getScheduledTimeForJob(&job)
+		scheduledTimeForJob, err := job.GetScheduledTimeForJob(&childJob)
 		if err != nil {
-			log.Error(err, "unable to parse schedule time for child job", "job", &job)
+			log.Error(err, "unable to parse schedule time for child job", "job", &childJob)
 			continue
 		}
 		if scheduledTimeForJob != nil {
@@ -320,75 +282,11 @@ func (r *CronJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		If we're not paused, we'll need to calculate the next scheduled run, and whether
 		or not we've got a run that we haven't processed yet.
 	*/
-
-	/*
-		We'll calculate the next scheduled time using our helpful cron library.
-		We'll start calculating appropriate times from our last run, or the creation
-		of the CronJob if we can't find a last run.
-
-		If there are too many missed runs and we don't have any deadlines set, we'll
-		bail so that we don't cause issues on controller restarts or wedges.
-
-		Otherwise, we'll just return the missed runs (of which we'll just use the latest),
-		and the next run, so that we can know when it's time to reconcile again.
-	*/
-	getNextSchedule := func(cronJob *batchv1.CronJob, now time.Time) (lastMissed time.Time, next time.Time, err error) {
-		sched, err := cron.ParseStandard(cronJob.Spec.Schedule)
-		if err != nil {
-			return time.Time{}, time.Time{}, fmt.Errorf("Unparseable schedule %q: %v", cronJob.Spec.Schedule, err)
-		}
-
-		// for optimization purposes, cheat a bit and start from our last observed run time
-		// we could reconstitute this here, but there's not much point, since we've
-		// just updated it.
-		var earliestTime time.Time
-		if cronJob.Status.LastScheduleTime != nil {
-			earliestTime = cronJob.Status.LastScheduleTime.Time
-		} else {
-			earliestTime = cronJob.ObjectMeta.CreationTimestamp.Time
-		}
-		if cronJob.Spec.StartingDeadlineSeconds != nil {
-			// controller is not going to schedule anything below this point
-			schedulingDeadline := now.Add(-time.Second * time.Duration(*cronJob.Spec.StartingDeadlineSeconds))
-
-			if schedulingDeadline.After(earliestTime) {
-				earliestTime = schedulingDeadline
-			}
-		}
-		if earliestTime.After(now) {
-			return time.Time{}, sched.Next(now), nil
-		}
-
-		starts := 0
-		for t := sched.Next(earliestTime); !t.After(now); t = sched.Next(t) {
-			lastMissed = t
-			// An object might miss several starts. For example, if
-			// controller gets wedged on Friday at 5:01pm when everyone has
-			// gone home, and someone comes in on Tuesday AM and discovers
-			// the problem and restarts the controller, then all the hourly
-			// jobs, more than 80 of them for one hourly scheduledJob, should
-			// all start running with no further intervention (if the scheduledJob
-			// allows concurrency and late starts).
-			//
-			// However, if there is a bug somewhere, or incorrect clock
-			// on controller's server or apiservers (for setting creationTimestamp)
-			// then there could be so many missed start times (it could be off
-			// by decades or more), that it would eat up all the CPU and memory
-			// of this controller. In that case, we want to not try to list
-			// all the missed start times.
-			starts++
-			if starts > 100 {
-				// We can't get the most recent times so just return an empty slice
-				return time.Time{}, time.Time{}, fmt.Errorf("Too many missed start times (> 100). Set or decrease .spec.startingDeadlineSeconds or check clock skew.")
-			}
-		}
-		return lastMissed, sched.Next(now), nil
-	}
 	// +kubebuilder:docs-gen:collapse=getNextSchedule
 
 	// figure out the next times that we need to create
 	// jobs at (or anything we missed).
-	missedRun, nextRun, err := getNextSchedule(&cronJob, r.Now())
+	missedRun, nextRun, err := cron.GetNextSchedule(&cronJob, r.Now())
 	if err != nil {
 		log.Error(err, "unable to figure out CronJob schedule")
 		// we don't really care about requeuing until we get an update that
@@ -452,47 +350,10 @@ func (r *CronJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		Once we've figured out what to do with existing jobs, we'll actually create our desired job
 	*/
 
-	/*
-		We need to construct a job based on our CronJob's template.  We'll copy over the spec
-		from the template and copy some basic object meta.
-
-		Then, we'll set the "scheduled time" annotation so that we can reconstitute our
-		`LastScheduleTime` field each reconcile.
-
-		Finally, we'll need to set an owner reference.  This allows the Kubernetes garbage collector
-		to clean up jobs when we delete the CronJob, and allows controller-runtime to figure out
-		which cronjob needs to be reconciled when a given job changes (is added, deleted, completes, etc).
-	*/
-	constructJobForCronJob := func(cronJob *batchv1.CronJob, scheduledTime time.Time) (*kbatch.Job, error) {
-		// We want job names for a given nominal start time to have a deterministic name to avoid the same job being created twice
-		name := fmt.Sprintf("%s-%d", cronJob.Name, scheduledTime.Unix())
-
-		job := &kbatch.Job{
-			ObjectMeta: metav1.ObjectMeta{
-				Labels:      make(map[string]string),
-				Annotations: make(map[string]string),
-				Name:        name,
-				Namespace:   cronJob.Namespace,
-			},
-			Spec: *cronJob.Spec.JobTemplate.Spec.DeepCopy(),
-		}
-		for k, v := range cronJob.Spec.JobTemplate.Annotations {
-			job.Annotations[k] = v
-		}
-		job.Annotations[scheduledTimeAnnotation] = scheduledTime.Format(time.RFC3339)
-		for k, v := range cronJob.Spec.JobTemplate.Labels {
-			job.Labels[k] = v
-		}
-		if err := ctrl.SetControllerReference(cronJob, job, r.Scheme); err != nil {
-			return nil, err
-		}
-
-		return job, nil
-	}
 	// +kubebuilder:docs-gen:collapse=constructJobForCronJob
 
 	// actually make the job...
-	job, err := constructJobForCronJob(&cronJob, missedRun)
+	job, err := job.ConstructJobForCronJob(&cronJob, missedRun, r.Scheme)
 	if err != nil {
 		log.Error(err, "unable to construct job from template")
 		// don't bother requeuing until we get a change to the spec
@@ -522,21 +383,12 @@ func (r *CronJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 /*
 ### Setup
 
-Finally, we'll update our setup.  In order to allow our reconciler to quickly
-look up Jobs by their owner, we'll need an index.  We declare an index key that
-we can later use with the client as a pseudo-field name, and then describe how to
-extract the indexed value from the Job object.  The indexer will automatically take
-care of namespaces for us, so we just have to extract the owner name if the Job has
-a CronJob owner.
+Finally, we'll update our setup.
 
 Additionally, we'll inform the manager that this controller owns some Jobs, so that it
 will automatically call Reconcile on the underlying CronJob when a Job changes, is
 deleted, etc.
 */
-var (
-	jobOwnerKey = ".metadata.controller"
-	apiGVStr    = batchv1.GroupVersion.String()
-)
 
 func (r *CronJobReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// set up a real clock, since we're not in a test
@@ -544,21 +396,7 @@ func (r *CronJobReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		r.Clock = realClock{}
 	}
 
-	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &kbatch.Job{}, jobOwnerKey, func(rawObj client.Object) []string {
-		// grab the job object, extract the owner...
-		job := rawObj.(*kbatch.Job)
-		owner := metav1.GetControllerOf(job)
-		if owner == nil {
-			return nil
-		}
-		// ...make sure it's a CronJob...
-		if owner.APIVersion != apiGVStr || owner.Kind != "CronJob" {
-			return nil
-		}
-
-		// ...and if so, return it
-		return []string{owner.Name}
-	}); err != nil {
+	if err := job.SetupJobIndexWithManager(mgr); err != nil {
 		return err
 	}
 
