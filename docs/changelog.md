@@ -5,3 +5,4 @@
 2. Refactor anonymous functions into separate packages
 3. Move envtest-driven integration tests into their own directories, add "integration" build tag.
 4. Use ko to build and the deploy the controller
+5. Configure CI and e2e testing

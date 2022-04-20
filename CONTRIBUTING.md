@@ -79,3 +79,7 @@ To deploy on an OpenShift CodeReady Containers cluster, do the following:
    ```sh
    $ make deploy IMAGE_REPO=default-route-openshift-image-registry.apps-crc.testing/project-system KO_OPTS="-B -t latest --sbom=none --insecure-registry"
    ```
+
+## Philosophy
+
+See the [philosophy](docs/philosophy.md) page for guiding principles on how this project is configured.
