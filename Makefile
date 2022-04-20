@@ -69,11 +69,15 @@ vet: ## Run go vet against code.
 
 .PHONY: test
 test: manifests generate fmt vet ## Run unit tests.
-	go test ./... -coverprofile unit.out
+	go test . ./api/... ./controllers/... ./pkg/... -coverprofile unit.out
 
 .PHONY: test-integration
 test-integration: manifests generate fmt vet envtest ## Run integration tests.
-	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) -p path)" go test ./test/integration/... -coverprofile integration.out -tags integration
+	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) -p path)" go test ./test/integration/... -coverprofile integration.out
+
+.PHONY: test-e2e
+test-e2e:
+	KUBECONFIG=${KUBECONFIG} go test -v ./test/e2e/...
 
 ##@ Build
 

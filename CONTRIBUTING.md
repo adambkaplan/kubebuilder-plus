@@ -2,6 +2,12 @@
 
 ## Building
 
+### Golang
+
+This project assumes you have golang 1.17 or higher installed on your machine.
+
+### Container Image
+
 This project uses [ko](https://github.com/google/ko) to build the container image with the
 controller manager and deploy it to a Kubernetes cluster. To change the destination container
 registry, provide the `IMAGE_REPO` variable to any make target:
@@ -40,14 +46,17 @@ By default the following arguments are passed to ko:
 
 - Ensure unit tests pass by running `make test`.
 - Ensure integration tests pass by running `make test-integration`.
+- Ensure that [cert-manager](https://cert-manager.io) has been installed on your cluster.
 - Ensure that you are able to build and deploy the controller image to your Kubernetes cluster:
 
-```sh
-$ make deploy IMAGE_REPO=quay.io/myusername
-```
+   ```sh
+   $ make deploy IMAGE_REPO=quay.io/myusername
+   ```
 
-*Note*: This will publish the container image to `quay.io/myusername/project:latest`. For the
-deployment to succeed, your cluster must have permission to pull this image.
+   *Note*: This will publish the container image to `quay.io/myusername/project:latest`. For the
+   deployment to succeed, your cluster must have permission to pull this image.
+
+- Optionally, ensure end to end tests succeed by running `make test-e2e`.
 
 ### KinD
 
@@ -56,6 +65,8 @@ TODO: Provide instructions on how to deploy with KinD
 ### CodeReady Containers
 
 To deploy on an OpenShift CodeReady Containers cluster, do the following:
+
+0. Install the cert-manager operator from OperatorHub.
 
 1. Create a project for the deployment (project-system by default)
 
